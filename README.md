@@ -38,3 +38,11 @@ Keys (type, then Enter): Enter starts or stops an episode, `s` or `f` labels the
 - If the follower lags its command by more than 0.35 rad for 0.5 s, tracking stops.
 - Only one process can own the CAN links. Stop any other controller (station agent, policy runner) first. If
   stopping it switches the motors off, support the arms while you do it.
+
+## Files
+
+- `leader_follower.py` runs teleop and recording.
+- `tests/test_sim.py` is the SimRobot plumbing test (`python -m pytest -q tests`).
+- `tools/check_mirror.py` is the evidence for joint copy: the best YAM mirror map is still 3.0 cm off per link.
+- `HANDOVER.md` covers taking the arms from a Dream station agent and giving them back.
+- `requirements.txt` lists the packages. On a Dream station, use its existing env, which already has them.
