@@ -306,6 +306,9 @@ class Tuning:
 
 ## A press of the right stick while recording asks for a second press within this long: discard, then home.
 HOME_CONFIRM_S = 2.0
+## Homing first lifts a tool lower than its home height up to it, for at most this long, then moves the joints home.
+LIFT_TIMEOUT_S = 4.0
+LIFT_TOLERANCE_M = 0.01
 
 
 class _RecordingHeadset:
@@ -353,6 +356,8 @@ class QuestCollector(collect.Collector):
                 clutch.on_engage = solver.reset_guard
         self._home_asked_s: float | None = None
         self._home_started_s: float | None = None
+        self._lift: dict[str, npt.NDArray[np.float64]] | None = None
+        self._lift_deadline_s = 0.0
         self._log(f"quest heading {math.degrees(self._heading):+.0f} deg "
                   f"({'saved' if t.heading_file.exists() else 'not calibrated: press Y, move, Y'}); "
                   "X locks the wrist")
@@ -367,7 +372,35 @@ class QuestCollector(collect.Collector):
                 self._warn(f"homing took over {collect.HOME_TIMEOUT_S:.0f} s: stopped where the arms are")
         if not self.homing:
             self._home_started_s = None
+            self._lift = None
         super().tick()
+
+    def _step_home(self) -> None:
+        """Lifts a tool that is below its home height straight up first, then the kit's joint-space move home.
+
+        The kit's home is a straight line in joint space, which from a low pose can drag the gripper along the table.
+        """
+        if self._lift is None:
+            self._lift = {}
+            for side, start in self._robot.start_joints.items():
+                solver = self._iks[side]
+                tool, home = solver.fk(self._command.joints[side]), solver.fk(start)
+                if tool[2, 3] < home[2, 3] - LIFT_TOLERANCE_M:
+                    target = tool.copy()
+                    target[2, 3] = home[2, 3]
+                    self._lift[side] = target
+            self._lift_deadline_s = time.monotonic() + LIFT_TIMEOUT_S
+        if self._lift and time.monotonic() < self._lift_deadline_s:
+            for side, target in list(self._lift.items()):
+                solver = self._iks[side]
+                guard = getattr(solver, "flip_guard", None)
+                if guard is not None:
+                    guard.reset()
+                self._command.joints[side] = solver.step(target, self._command.joints[side], self._dt_s)
+                if solver.fk(self._command.joints[side])[2, 3] >= target[2, 3] - LIFT_TOLERANCE_M:
+                    del self._lift[side]
+            return
+        super()._step_home()
 
     def _resync_lagging(self, measured: arms.Joints) -> None:
         blocked = [side for side, joints in measured.items()

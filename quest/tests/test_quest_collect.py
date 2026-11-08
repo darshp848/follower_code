@@ -307,3 +307,29 @@ def test_flip_guard_is_on_and_resets_at_every_engage(tmp_path):
     headset.grip["right"] = 1.0
     c.tick()
     np.testing.assert_allclose(guard.offset, np.eye(3))
+
+
+def test_homing_lifts_a_low_tool_before_moving_the_joints(tmp_path):
+    c, arms, headset = _collector(tmp_path, qc.QuestCollector)
+    home_z = _tool(c, arms)[2, 3]
+    headset.grip["right"] = 1.0
+    c.tick()
+    headset.poses["right"][1, 3] = -0.06              # hand 6 cm down (Quest -y): the tool goes below home
+    for _ in range(240):
+        c.tick()
+    headset.grip["right"] = 0.0
+    c.tick()
+    low = _tool(c, arms)[:3, 3].copy()
+    assert low[2] < home_z - 0.04
+    headset.press.add("RJ")
+    heights, sideways = [], []
+    for _ in range(60 * 15):
+        c.tick()
+        tool = _tool(c, arms)[:3, 3]
+        heights.append(tool[2])
+        if tool[2] < home_z - 0.01:                   # still lifting: the tool moves straight up
+            sideways.append(np.linalg.norm(tool[:2] - low[:2]))
+    assert not c.homing
+    assert np.all(np.diff(heights[:30]) > -1e-4)      # it starts by going up, never down
+    assert max(sideways) < 0.01
+    np.testing.assert_allclose(arms.joints["right"], arms.start_joints["right"], atol=2e-3)
