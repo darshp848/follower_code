@@ -1,9 +1,43 @@
 # follower_code
 
-> **YAM arms only.** This drives i2rt YAM arms. The MakerMods Physical AI Hackathon stations use **MakerMods Metal**
-> arms (`body: metal` in `~/.dreamlabs/station.yaml`). Don't run this script on them: it refuses on any station
-> whose config doesn't say `body: yam`. For a Metal leader/follower, use MakerMods' gravity-compensated
-> `metal_leader` (their LeRobot fork, which needs Pinocchio).
+## Metal stations: `metal/leader_collect.py`
+
+One Metal arm is the leader, running MakerMods' gravity-compensated `metal_leader` (kp 0, Pinocchio gravity and
+friction feedforward). You move it by hand and squeeze its gripper, and the other arm follows. Everything else is
+the hackathon kit's `dhk-collect`: its dashboard, cameras, device checks, station lock, homing, lag check and
+**LeRobot v2.1** writer. So the dataset is the one `tools/add_eef.py` and Dream fine-tuning take. None of the kit's
+files are changed.
+
+```bash
+# on the station, inside tmux; the kit's venv needs Pinocchio: uv pip install "pin>=3.1,<4" "cmeel-urdfdom>=4,<5" "cmeel-tinyxml2<11" numpy==2.2.6
+cd ~/physical-ai-hacks
+.venv/bin/python ~/follower_code/metal/leader_collect.py --config configs/station.yaml --dry-run
+.venv/bin/python ~/follower_code/metal/leader_collect.py --config configs/station.yaml --task "unplug the cable"
+~/dream-env/bin/python tools/add_eef.py ~/hackathon_data/my-task --arm metal --replace
+```
+
+- **Keys** (type, then Enter): Enter opens the arms, then starts or saves an episode. `d` discards the episode, `h`
+  sends the follower home, and Ctrl+C quits. On quit both arms are walked back to their start pose and released,
+  MakerMods' way.
+- **Leader:** `--leader left` is the default.
+- **What's recorded for the leader's side:** its *parked* pose by default, because at deploy time that arm stays
+  parked. `--record-leader` records its real motion instead. The left wrist camera still shows the leader and your
+  hand.
+- **Follower motion:** the follower closes the gap to the leader at 0.4 rad/s, then follows at the config's
+  `teleop.max_joint_speed_rad_s`. If it falls more than 0.35 rad behind, the kit re-syncs it.
+- **Dry run:** both arms open with torque off. Nothing is energized and the leader is limp, so support it.
+- **Tests:** `cd ~/physical-ai-hacks && .venv/bin/python -m pytest -q ~/follower_code/metal/tests` runs the kit's
+  real Collector and writer over fake Metal devices, then runs `tools/add_eef.py`, which applies Dream's dataset
+  checks. All 6 pass on the hackathon NUC.
+- **Not covered by the tests:** the real arms. Gravity compensation, how the leader feels and the follower's lag
+  are untested until a dry run and a real run on hardware.
+
+## YAM arms: `leader_follower.py`
+
+> **Two recorders here, one per arm type.**
+> - `metal/leader_collect.py`: MakerMods **Metal** stations, such as the MakerMods Physical AI Hackathon kit. Start
+>   here on those.
+> - `leader_follower.py`: i2rt **YAM** arms. It refuses to run unless `~/.dreamlabs/station.yaml` says `body: yam`.
 
 Leader/follower teleoperation and demo recording for a pair of YAM arms driven by
 [i2rt](https://github.com/i2rt-robotics/i2rt).
