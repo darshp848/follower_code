@@ -16,7 +16,11 @@ the kit's files change.
 | Jittery | A **One Euro filter** on each controller pose, which restarts at every engage so engaging never jumps. The IK damping is also raised from 1e-3 to 1e-2. |
 | Laggy | The loop runs at **60 Hz** instead of 30, and the joint cap is **2.5 rad/s** instead of 1.5. |
 | Arm sits low | **Gravity feedforward, on by default** (Metal only; `--no-gravity-ff` turns it off). It's the same MakerMods gravity model the leader/follower uses, which took shoulder_lift from 4–6° low to +0.2° on the station's arms. |
-| Wrist goes wild | A 2° rotation dead band, `--rotation-scale` (tool turn per hand turn), and **X** to lock or unlock the wrist (the tool keeps its orientation). |
+| Wrist goes wild | `--rotation-scale` (tool turn per hand turn), and **X** to lock or unlock the wrist (the tool keeps its orientation). |
+| Sudden big joint jumps | A **wrist-flip guard** (`quest/continuity.py`). In the station's Quest episodes, when joint5 sits on its limit (-82°) a small hand turn makes the IK go the long way round: joint4 and joint6 swing 130-190° for 1.5-2.5 s while the tool turns only 8-40°. The guard sees the wrist turning a lot for little tool turn, and holds the tool's orientation from there while its position keeps following. `--no-flip-guard` turns it off. |
+| Wrist lags hand turns | **Wrist joints capped at 4 rad/s** (`--wrist-max-joint-speed`) instead of the arm's 2.5, a **faster rotation filter** (0.5 Hz when still, rising 3 Hz per rad/s), and **no rotation dead band** (the old 2° band left a 2.8° median turn error). |
+| Tracking glitch lunges | A controller pose that jumps 8 cm or 45° in one reading is treated as a glitch. The arm holds, and the clutch re-engages on the new pose. `--no-jump-guard` turns it off. |
+| Home button does nothing | The kit ignores the right stick while recording. Here, a press warns you, and a **second press within 2 s discards the episode and homes**. Homing used to run forever on an arm that can't reach home (when it's blocked, say), which froze teleop. Now it stops with a warning, and it also stops after 30 s. |
 
 ```bash
 cd ~/physical-ai-hacks
@@ -25,13 +29,21 @@ cd ~/physical-ai-hacks
 ```
 
 - **Tuning:** `--filter-min-cutoff` lower is smoother when still. `--filter-beta` higher is less lag when moving
-  fast. `--rotation-scale 0.5` halves wrist turns, and `--control-hz 30` restores the kit's rate.
+  fast. `--rot-filter-beta` is the same trade-off for hand turns: 2 is smoother, 8 follows sooner. `--rotation-scale 0.5`
+  halves wrist turns, and `--control-hz 30` restores the kit's rate.
+- **Replay bench** (offline, on the Metal URDF): 40 fast-wrist events from `unplug-v1` and `unplug-split-v1` replayed
+  through the IK. With the kit's IK, 7 of the 40 swing joint4 or joint6 more than 90° (the worst swings 194°). With the
+  guard, 1 of the 40 does (the worst swings 99°), and the tool's position stays within 8 mm. Human motion recorded on
+  the leader arm (14 episodes), with 1.5 mm and 0.4° of Quest-like noise added: the wrist follows hand turns 27 ms
+  behind, where the previous defaults lagged 105 ms. The median turn error is 1.0° (it was 2.8°), and rotation jitter
+  is 40 % below the unfiltered kit's.
 - **Loop rate:** check the dashboard's loop rate. If it can't hold 60 Hz, use `--control-hz 30`, or recordings
   will be stretched in time.
 - **Measured offline:** on the kit's test arm with 2 mm of tracking noise, the tool jitters 4.7× less than the
   kit's (0.47 mm against 2.2 mm), at about 17 ms more lag on a 5 cm move.
-- **Tests:** `.venv/bin/python -m pytest -q ~/follower_code/quest/tests` runs them over the kit's own fakes (14
-  pass). The kit's own suite still passes.
+- **Tests:** `.venv/bin/python -m pytest -q ~/follower_code/quest/tests` runs them over the kit's own fakes. The 4 new
+  ones, for homing, glitches and the flip guard, have not been run on the NUC yet. `test_continuity.py` needs only numpy
+  (6 pass).
 - **Not tested:** a real Quest. The gravity model is proven on the arms through the leader/follower, not yet through this launcher.
 
 ## Metal stations: `metal/leader_collect.py`

@@ -16,6 +16,11 @@ for this process only; none of the kit's files change:
 - **The IK** (laggy, jittery): the loop runs at `--control-hz` (60, against the kit's 30), the joint speed cap is
   `--max-joint-speed` (2.5 rad/s, against 1.5), and the solver's damping is raised (`--ik-damping`), which stops the
   joints chattering near singular poses.
+- **Continuity guards** (continuity.py, big sudden joint jumps): a wrist-flip guard holds the tool's orientation when
+  the IK would whirl joint4/joint6 the long way round from joint5's limit, wrist joints get their own speed cap
+  (`--wrist-max-joint-speed`, 4 rad/s) so turns keep up, and a controller pose that jumps 8 cm or 45 deg in one
+  reading is a tracking glitch: the arm holds and the clutch re-engages there. The right stick homes while
+  recording on a second press within 2 s (discarding the episode), and homing stops on a blocked arm.
 - **Gravity feedforward** (Metal only, on by default, `--no-gravity-ff` turns it off): fills each joint's gravity
   torque into the follower's MIT frames, so the arm stops sitting under its target (shoulder_lift 4 to 6 deg low
   without it). It is metal/leader_collect.py's FollowerGravity, MakerMods' own Metal model, which took the
@@ -36,13 +41,17 @@ import json
 import math
 import pathlib
 import sys
-from typing import Any
+import time
+from typing import Any, Callable
 
 import mink
 import numpy as np
 import numpy.typing as npt
 
 from dream_hackathon import arms, collect, config, ik, quest, teleop
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from continuity import TrackingJumpGuard, WristFlipGuard, per_joint_caps  # noqa: E402
 
 HEADING_FILE = pathlib.Path("~/.cache/follower_code/quest_heading.json").expanduser()
 ## The calibration move must be at least this long, horizontally, to count.
@@ -136,11 +145,15 @@ class PoseFilter:
     """One Euro on a 4x4 pose: on the position, and on the rotation along the turn from the filtered one to the raw.
 
     The rotation's cutoff rises with the filtered turning speed (rad/s) as the position's does with its speed (m/s).
+    The rotation has its own still cutoff (`rot_min_cutoff_hz`, default the position's): hand turns need a faster
+    filter than hand moves, or the wrist trails the hand (beta_rad 0.5 lagged turns by ~105 ms on the replay bench).
     """
 
-    def __init__(self, min_cutoff_hz: float, beta_m: float, beta_rad: float, d_cutoff_hz: float = 1.0) -> None:
+    def __init__(self, min_cutoff_hz: float, beta_m: float, beta_rad: float, d_cutoff_hz: float = 1.0,
+                 rot_min_cutoff_hz: float | None = None) -> None:
         self._position = OneEuro(min_cutoff_hz, beta_m, d_cutoff_hz)
-        self._min_cutoff, self._beta_rad, self._d_cutoff = min_cutoff_hz, beta_rad, d_cutoff_hz
+        self._min_cutoff = min_cutoff_hz if rot_min_cutoff_hz is None else rot_min_cutoff_hz
+        self._beta_rad, self._d_cutoff = beta_rad, d_cutoff_hz
         self._rotation: npt.NDArray[np.float64] | None = None
         self._turn_speed = 0.0
 
@@ -173,12 +186,21 @@ class SmoothClutch(teleop.Clutch):
     wrist_locked: bool = False
     dt_s: float = 1.0 / 60.0
     filter: PoseFilter | None = None
+    jump_guard: TrackingJumpGuard | None = None
+    on_engage: Callable[[], None] | None = None
 
     def update(self, grip: float, controller: Any, tool: Any) -> Any:
+        if self.jump_guard is not None and self.jump_guard.is_glitch(controller) and self.engaged:
+            # A tracking glitch: hold where the tool is; the next tick re-engages on the new pose, so no lunge.
+            self.engaged = False
+            return None
+        engaging = controller is not None and not self.engaged and grip >= teleop.GRIP_ENGAGE
         if controller is not None and self.filter is not None:
-            if not self.engaged and grip >= teleop.GRIP_ENGAGE:
+            if engaging:
                 self.filter.reset()                    # engage on the hand's pose as it is, no filter lag
             controller = self.filter(controller, self.dt_s)
+        if engaging and self.on_engage is not None:
+            self.on_engage()
         return super().update(grip, controller, tool)
 
     def _target(self, controller: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
@@ -200,19 +222,51 @@ class SmoothClutch(teleop.Clutch):
 
 # ------------------------------------------------------------------------------------------------ IK
 class SmoothIK(ik.ArmIK):
-    """The kit's ArmIK with its solver damping as a setting (the kit's 1e-3 chatters near singular poses)."""
+    """The kit's ArmIK with its damping as a setting, per-joint speed caps, and a wrist-flip guard.
+
+    - Damping: the kit's 1e-3 chatters near singular poses.
+    - Per-joint caps (`joint_caps_rad_s`): the wrist can be faster than the shoulder, so hand turns keep up.
+    - Flip guard (continuity.WristFlipGuard): when the wrist joints turn a lot for little tool turn (the kit's IK
+      going the long way round from a joint limit), the tool's orientation is held from there instead.
+    """
 
     damping: float = 1e-2
+    flip_guard: WristFlipGuard | None = None
 
     @classmethod
-    def adopt(cls, solver: ik.ArmIK, damping: float, orientation_cost: float) -> "SmoothIK":
+    def adopt(cls, solver: ik.ArmIK, damping: float, orientation_cost: float,
+              joint_caps_rad_s: npt.ArrayLike | None = None, flip_guard: WristFlipGuard | None = None) -> "SmoothIK":
         solver.__class__ = cls
         solver.damping = damping
         solver._task = mink.FrameTask(solver._site, "site", position_cost=1.0, orientation_cost=orientation_cost,
                                       lm_damping=damping)
+        if joint_caps_rad_s is not None:
+            caps = np.broadcast_to(np.asarray(joint_caps_rad_s, dtype=np.float64), solver._qpos_index.shape).copy()
+            model = solver._configuration.model
+            names = {int(model.jnt_qposadr[j]): model.joint(j).name for j in range(model.njnt)}
+            solver._max_speed = caps
+            solver._limits = [solver._limits[0],
+                              mink.VelocityLimit(model, {names[int(a)]: float(c)
+                                                         for a, c in zip(solver._qpos_index, caps)})]
+        solver.flip_guard = flip_guard
         return solver  # type: ignore[return-value]
 
-    def step(self, target, joints_rad, dt_s):  # noqa: ANN001 - ArmIK.step with `damping` in place of 1e-3
+    def reset_guard(self) -> None:
+        if self.flip_guard is not None:
+            self.flip_guard.reset()
+
+    def step(self, target, joints_rad, dt_s):  # noqa: ANN001 - ArmIK.step plus the flip guard
+        guard = self.flip_guard
+        if guard is None:
+            return self._solve(target, joints_rad, dt_s)
+        joints = np.asarray(joints_rad, dtype=np.float64)
+        solved = self._solve(guard.apply(target), joints, dt_s)
+        tool_before, tool_after = self.fk(joints), self.fk(solved)
+        if guard.observe(joints, solved, tool_before, tool_after, dt_s):
+            solved = self._solve(guard.rebase(tool_before, target), joints, dt_s)
+        return solved
+
+    def _solve(self, target, joints_rad, dt_s):  # noqa: ANN001 - ArmIK.step with `damping` in place of 1e-3
         seed = np.asarray(joints_rad, dtype=np.float64) * self._signs
         self._set_model_joints(np.clip(seed, self._low, self._high))
         self._task.set_target(mink.SE3.from_matrix(target))
@@ -232,12 +286,26 @@ class SmoothIK(ik.ArmIK):
 # ------------------------------------------------------------------------------------------------ collector
 @dataclasses.dataclass(frozen=True)
 class Tuning:
+    """The clutch, filter and guard settings.
+
+    Rotation defaults come from the replay bench (human leader-arm motion with 1.5 mm / 0.4 deg of Quest-like noise):
+    no dead band (a subtractive 2 deg band left a 2.8 deg median turn error), and a rotation filter at 0.5 Hz still
+    rising 3 Hz per rad/s, which turns follow ~25-35 ms behind the hand, against 105 ms for beta 0.5.
+    """
+
     rotation_scale: float = 1.0
-    rotation_deadband_deg: float = 2.0
+    rotation_deadband_deg: float = 0.0
     filter_min_cutoff_hz: float = 0.7
     filter_beta_m: float = 10.0
-    filter_beta_rad: float = 0.5
+    filter_beta_rad: float = 3.0
+    filter_rot_min_cutoff_hz: float = 0.5
+    flip_guard: bool = True
+    jump_guard: bool = True
     heading_file: pathlib.Path = HEADING_FILE
+
+
+## A press of the right stick while recording asks for a second press within this long: discard, then home.
+HOME_CONFIRM_S = 2.0
 
 
 class _RecordingHeadset:
@@ -272,14 +340,56 @@ class QuestCollector(collect.Collector):
                                translation_scale=station.teleop.translation_scale, heading_rad=self._heading,
                                rotation_scale=t.rotation_scale,
                                rotation_deadband_rad=math.radians(t.rotation_deadband_deg), dt_s=self._dt_s,
-                               filter=PoseFilter(t.filter_min_cutoff_hz, t.filter_beta_m, t.filter_beta_rad))
+                               filter=PoseFilter(t.filter_min_cutoff_hz, t.filter_beta_m, t.filter_beta_rad,
+                                                 rot_min_cutoff_hz=t.filter_rot_min_cutoff_hz),
+                               jump_guard=TrackingJumpGuard() if t.jump_guard else None)
             for side, arm in station.arms.items()
         }
+        for side, clutch in self._clutches.items():
+            solver = self._iks.get(side)
+            if isinstance(solver, SmoothIK):
+                if t.flip_guard and solver.flip_guard is None:
+                    solver.flip_guard = WristFlipGuard()
+                clutch.on_engage = solver.reset_guard
+        self._home_asked_s: float | None = None
+        self._home_started_s: float | None = None
         self._log(f"quest heading {math.degrees(self._heading):+.0f} deg "
                   f"({'saved' if t.heading_file.exists() else 'not calibrated: press Y, move, Y'}); "
                   "X locks the wrist")
 
+    # ---- homing: the kit ignores the right stick while recording, and a blocked arm keeps homing forever
+    def tick(self) -> None:
+        if self.homing:
+            if self._home_started_s is None:
+                self._home_started_s = time.monotonic()
+            elif time.monotonic() - self._home_started_s > collect.HOME_TIMEOUT_S:
+                self.homing = False
+                self._warn(f"homing took over {collect.HOME_TIMEOUT_S:.0f} s: stopped where the arms are")
+        if not self.homing:
+            self._home_started_s = None
+        super().tick()
+
+    def _resync_lagging(self, measured: arms.Joints) -> None:
+        blocked = [side for side, joints in measured.items()
+                   if float(np.max(np.abs(self._command.joints[side] - joints))) > collect.MAX_TRACKING_ERROR_RAD]
+        super()._resync_lagging(measured)
+        if blocked and self.homing:
+            # The kit re-syncs the command and keeps homing, which never ends when the arm is blocked.
+            self.homing = False
+            self._warn(f"{' and '.join(blocked)} arm cannot reach home (blocked?): homing stopped; "
+                       "clear it and press the right stick again")
+
     def _handle_buttons(self, pressed: frozenset[str]) -> None:
+        if "RJ" in pressed and self.episode is not None:
+            now = time.monotonic()
+            if self._home_asked_s is not None and now - self._home_asked_s <= HOME_CONFIRM_S:
+                self._home_asked_s = None
+                self.discard()                         # the kit's homing needs no episode open
+            else:
+                self._home_asked_s = now
+                self._warn(f"recording: press the right stick again within {HOME_CONFIRM_S:.0f} s to discard "
+                           "this episode and home (or A to save it first)")
+                pressed = pressed - {"RJ"}
         super()._handle_buttons(pressed)
         if "X" in pressed:
             locked = not next(iter(self._clutches.values())).wrist_locked
@@ -350,7 +460,8 @@ def _with_gravity(open_arms: Any) -> Any:
 
 
 # ------------------------------------------------------------------------------------------------ launcher
-def install(*, tuning: Tuning, ik_damping: float, orientation_cost: float, gravity_ff: bool) -> None:
+def install(*, tuning: Tuning, ik_damping: float, orientation_cost: float, gravity_ff: bool,
+            wrist_max_joint_speed: float | None = None) -> None:
     """Swaps the clutch, the IK and (optionally) the arm opener into the kit's collect module, for this process."""
     QuestCollector.tuning = tuning
     collect.Collector = QuestCollector  # type: ignore[misc]
@@ -358,7 +469,10 @@ def install(*, tuning: Tuning, ik_damping: float, orientation_cost: float, gravi
     open_ik = arms.open_ik
 
     def smooth_ik(station: config.StationConfig) -> dict[str, ik.ArmIK]:
-        return {side: SmoothIK.adopt(solver, ik_damping, orientation_cost) for side, solver in open_ik(station).items()}
+        caps = per_joint_caps(station.teleop.max_joint_speed_rad_s, wrist_max_joint_speed)
+        return {side: SmoothIK.adopt(solver, ik_damping, orientation_cost, joint_caps_rad_s=caps,
+                                     flip_guard=WristFlipGuard() if tuning.flip_guard else None)
+                for side, solver in open_ik(station).items()}
 
     arms.open_ik = smooth_ik  # type: ignore[assignment]
     if gravity_ff:
@@ -382,10 +496,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--dashboard-port", type=int, default=collect.dashboard.DEFAULT_PORT)
     p.add_argument("--control-hz", type=int, default=60)
     p.add_argument("--max-joint-speed", type=float, default=2.5, help="rad/s")
+    p.add_argument("--wrist-max-joint-speed", type=float, default=4.0,
+                   help="rad/s for joints 4-6 (the wrist), so hand turns keep up; 0 uses --max-joint-speed")
     p.add_argument("--rotation-scale", type=float, default=1.0, help="tool turn per hand turn")
-    p.add_argument("--rotation-deadband-deg", type=float, default=2.0)
+    p.add_argument("--rotation-deadband-deg", type=float, default=0.0)
     p.add_argument("--filter-min-cutoff", type=float, default=0.7, help="Hz: lower is smoother when still")
     p.add_argument("--filter-beta", type=float, default=10.0, help="higher is less lag when moving fast")
+    p.add_argument("--rot-filter-min-cutoff", type=float, default=0.5, help="Hz: the rotation filter when still")
+    p.add_argument("--rot-filter-beta", type=float, default=3.0,
+                   help="Hz per rad/s: higher makes the wrist follow fast turns sooner, with more jitter")
+    p.add_argument("--flip-guard", action=argparse.BooleanOptionalAction, default=True,
+                   help="hold the tool's orientation when the IK would whirl the wrist the long way round")
+    p.add_argument("--jump-guard", action=argparse.BooleanOptionalAction, default=True,
+                   help="treat a controller pose that jumps 8 cm or 45 deg in one reading as a tracking glitch")
     p.add_argument("--ik-damping", type=float, default=1e-2)
     p.add_argument("--orientation-cost", type=float, default=0.5)
     p.add_argument("--gravity-ff", action=argparse.BooleanOptionalAction, default=True,
@@ -400,8 +523,12 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(f"config: {error}")
     if a.dataset_dir:
         station = dataclasses.replace(station, dataset_dir=pathlib.Path(a.dataset_dir).expanduser())
-    install(tuning=Tuning(a.rotation_scale, a.rotation_deadband_deg, a.filter_min_cutoff, a.filter_beta),
-            ik_damping=a.ik_damping, orientation_cost=a.orientation_cost, gravity_ff=a.gravity_ff)
+    tuning = Tuning(rotation_scale=a.rotation_scale, rotation_deadband_deg=a.rotation_deadband_deg,
+                    filter_min_cutoff_hz=a.filter_min_cutoff, filter_beta_m=a.filter_beta,
+                    filter_beta_rad=a.rot_filter_beta, filter_rot_min_cutoff_hz=a.rot_filter_min_cutoff,
+                    flip_guard=a.flip_guard, jump_guard=a.jump_guard)
+    install(tuning=tuning, ik_damping=a.ik_damping, orientation_cost=a.orientation_cost, gravity_ff=a.gravity_ff,
+            wrist_max_joint_speed=a.wrist_max_joint_speed or None)
     try:
         collect.run(station, collect.choose_task(a.task, station.task), dry_run=a.dry_run, sim=False,
                     quest_ip=a.quest_ip, dashboard_port=a.dashboard_port)

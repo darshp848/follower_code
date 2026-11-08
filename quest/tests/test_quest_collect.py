@@ -245,3 +245,65 @@ def test_gravity_is_on_by_default_and_uses_the_makermods_model(monkeypatch):
 def test_no_gravity_on_a_dry_run_or_other_arms(arm, energize):
     motors, _, sent = _opened_with_gravity(arm, energize)
     assert all(sent[m][4] == 0.0 for m in motors)
+
+
+def _moved_away(tmp_path, logs):
+    """A collector whose right arm was driven ~0.6 rad from its start; the Quest released."""
+    c, arms, headset = _collector(tmp_path, qc.QuestCollector, logs=logs)
+    arms.joints["right"] = arms.start_joints["right"] + np.array([0.6, -0.4, 0.3, 0.0, 0.0, 0.0])
+    c._command.joints["right"] = arms.joints["right"].copy()
+    return c, arms, headset
+
+
+def test_home_while_recording_needs_a_second_press_then_discards_and_homes(tmp_path):
+    logs = []
+    c, arms, headset = _moved_away(tmp_path, logs)
+    headset.press.add("A")
+    c.tick()
+    assert c.episode is not None
+    headset.press.add("RJ")
+    c.tick()
+    assert c.episode is not None and not c.homing
+    assert any("press the right stick again" in line for line in logs), logs
+    headset.press.add("RJ")
+    c.tick()
+    assert c.episode is None and c.homing
+    for _ in range(60 * 10):
+        c.tick()
+    assert not c.homing
+    np.testing.assert_allclose(arms.joints["right"], arms.start_joints["right"], atol=2e-3)
+
+
+def test_a_blocked_arm_stops_homing_instead_of_freezing_teleop(tmp_path):
+    logs = []
+    c, arms, headset = _moved_away(tmp_path, logs)
+    arms.stuck = True                                  # the arm cannot move (against the table, say)
+    headset.press.add("RJ")
+    c.tick()
+    assert c.homing
+    for _ in range(60 * 3):
+        c.tick()
+    assert not c.homing
+    assert any("cannot reach home" in line for line in logs), logs
+
+
+def test_a_tracking_glitch_does_not_move_the_arm(tmp_path):
+    c, arms, headset = _collector(tmp_path, qc.QuestCollector)
+    headset.grip["right"] = 1.0
+    for _ in range(5):
+        c.tick()
+    before = arms.joints["right"].copy()
+    headset.poses["right"][:3, 3] = [0.4, 0.1, -0.3]   # 50 cm in one reading: tracking jumped
+    for _ in range(60):
+        c.tick()
+    np.testing.assert_allclose(arms.joints["right"], before, atol=1e-3)
+
+
+def test_flip_guard_is_on_and_resets_at_every_engage(tmp_path):
+    c, arms, headset = _collector(tmp_path, qc.QuestCollector)
+    guard = c._iks["right"].flip_guard
+    assert guard is not None
+    guard.offset = qc.rotation_about(np.array([0.0, 0.0, 1.0]), 0.5)
+    headset.grip["right"] = 1.0
+    c.tick()
+    np.testing.assert_allclose(guard.offset, np.eye(3))
