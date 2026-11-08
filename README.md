@@ -5,6 +5,34 @@
 >   here on those.
 > - `leader_follower.py`: i2rt **YAM** arms. It refuses to run unless `~/.dreamlabs/station.yaml` says `body: yam`.
 
+## Better Quest teleop: `quest/quest_collect.py`
+
+This runs the kit's own `dhk-collect` with four pieces swapped in. They apply to this process only, and none of
+the kit's files change.
+
+| Problem | Fix |
+|---|---|
+| Wrong direction | **Heading calibration.** The Quest's frame turns with wherever the headset faced when tracking started, so the config's fixed `quest_to_base` can be off by any angle. Press **Y**, move the right controller about 20 cm in the arm's forward direction, then press **Y** again. The heading is saved to `~/.cache/follower_code/quest_heading.json`. |
+| Jittery | A **One Euro filter** on each controller pose, which restarts at every engage so engaging never jumps. The IK damping is also raised from 1e-3 to 1e-2. |
+| Laggy | The loop runs at **60 Hz** instead of 30, and the joint cap is **2.5 rad/s** instead of 1.5. `--gravity-ff` (Metal only) adds gravity torque so the tool stops sitting 2.5 to 6.5 cm low. It's adapted from Daniel's `teleop-tuning` branch and hasn't run on hardware. |
+| Wrist goes wild | A 2° rotation dead band, `--rotation-scale` (tool turn per hand turn), and **X** to lock or unlock the wrist (the tool keeps its orientation). |
+
+```bash
+cd ~/physical-ai-hacks
+.venv/bin/python ~/follower_code/quest/quest_collect.py --config configs/station.yaml --dry-run
+.venv/bin/python ~/follower_code/quest/quest_collect.py --config configs/station.yaml --dataset-dir ~/hackathon_data/my-task
+```
+
+- **Tuning:** `--filter-min-cutoff` lower is smoother when still. `--filter-beta` higher is less lag when moving
+  fast. `--rotation-scale 0.5` halves wrist turns, and `--control-hz 30` restores the kit's rate.
+- **Loop rate:** check the dashboard's loop rate. If it can't hold 60 Hz, use `--control-hz 30`, or recordings
+  will be stretched in time.
+- **Measured offline:** on the kit's test arm with 2 mm of tracking noise, the tool jitters 4.7× less than the
+  kit's (0.47 mm against 2.2 mm), at about 17 ms more lag on a 5 cm move.
+- **Tests:** `.venv/bin/python -m pytest -q ~/follower_code/quest/tests` runs them over the kit's own fakes (11
+  pass). The kit's own suite still passes.
+- **Not tested:** a real Quest or real arms.
+
 ## Metal stations: `metal/leader_collect.py`
 
 One Metal arm is the leader, running MakerMods' gravity-compensated `metal_leader` (kp 0, Pinocchio gravity and
