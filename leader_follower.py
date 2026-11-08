@@ -89,9 +89,26 @@ class Camera(threading.Thread):
 
 
 # ---------------------------------------------------------------------------------------------------------- teleop
+def station_body(path: Path = Path.home() / '.dreamlabs' / 'station.yaml') -> str | None:
+    """The `body:` a Dream station config names, or None without one."""
+    if not path.exists():
+        return None
+    for line in path.read_text().splitlines():
+        if line.startswith('body:'):
+            return line.split(':', 1)[1].split('#')[0].strip()
+    return None
+
+
 class Teleop:
     def __init__(self, args):
         from i2rt.robots.get_robot import get_yam_robot
+        if not args.sim:
+            body = station_body()
+            if body != 'yam' and not args.arms_are_yam:
+                raise SystemExit(
+                    f'refusing: this script drives i2rt YAM arms, and the station config says body: {body}. '
+                    'Running YAM motor ids, directions and gravity model on another arm (e.g. a MakerMods Metal) '
+                    'can drop or drive it. Pass --arms-are-yam only if the arms really are YAMs.')
         self.args = args
         self.leader = get_yam_robot(channel=args.leader, zero_gravity_mode=True, sim=args.sim)
         self.follower = get_yam_robot(channel=args.follower, zero_gravity_mode=False, sim=args.sim)
@@ -239,6 +256,8 @@ def main():
     p.add_argument('--cam', action='append', default=[], help='name=device, e.g. scene=0 or wrist_r=/dev/video2')
     p.add_argument('--sim', action='store_true', help='i2rt SimRobot for both arms, scripted leader, one episode')
     p.add_argument('--sim-episode-steps', type=int, default=300)
+    p.add_argument('--arms-are-yam', action='store_true',
+                   help='override the station-config check when the arms are YAMs but no config says so')
     t = Teleop(p.parse_args())
     try:
         t.run()

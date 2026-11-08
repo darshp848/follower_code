@@ -1,5 +1,10 @@
 # follower_code
 
+> **YAM arms only.** This drives i2rt YAM arms. The MakerMods Physical AI Hackathon stations use **MakerMods Metal**
+> arms (`body: metal` in `~/.dreamlabs/station.yaml`). Don't run this script on them: it refuses on any station
+> whose config doesn't say `body: yam`. For a Metal leader/follower, use MakerMods' gravity-compensated
+> `metal_leader` (their LeRobot fork, which needs Pinocchio).
+
 Leader/follower teleoperation and demo recording for a pair of YAM arms driven by
 [i2rt](https://github.com/i2rt-robotics/i2rt).
 
