@@ -14,7 +14,8 @@ the kit's files change.
 |---|---|
 | Wrong direction | **Heading calibration.** The Quest's frame turns with wherever the headset faced when tracking started, so the config's fixed `quest_to_base` can be off by any angle. Press **Y**, move the right controller about 20 cm in the arm's forward direction, then press **Y** again. The heading is saved to `~/.cache/follower_code/quest_heading.json`. |
 | Jittery | A **One Euro filter** on each controller pose, which restarts at every engage so engaging never jumps. The IK damping is also raised from 1e-3 to 1e-2. |
-| Laggy | The loop runs at **60 Hz** instead of 30, and the joint cap is **2.5 rad/s** instead of 1.5. `--gravity-ff` (Metal only) adds gravity torque so the tool stops sitting 2.5 to 6.5 cm low. It's adapted from Daniel's `teleop-tuning` branch and hasn't run on hardware. |
+| Laggy | The loop runs at **60 Hz** instead of 30, and the joint cap is **2.5 rad/s** instead of 1.5. |
+| Arm sits low | **Gravity feedforward, on by default** (Metal only; `--no-gravity-ff` turns it off). It's the same MakerMods gravity model the leader/follower uses, which took shoulder_lift from 4–6° low to +0.2° on the station's arms. |
 | Wrist goes wild | A 2° rotation dead band, `--rotation-scale` (tool turn per hand turn), and **X** to lock or unlock the wrist (the tool keeps its orientation). |
 
 ```bash
@@ -29,9 +30,9 @@ cd ~/physical-ai-hacks
   will be stretched in time.
 - **Measured offline:** on the kit's test arm with 2 mm of tracking noise, the tool jitters 4.7× less than the
   kit's (0.47 mm against 2.2 mm), at about 17 ms more lag on a 5 cm move.
-- **Tests:** `.venv/bin/python -m pytest -q ~/follower_code/quest/tests` runs them over the kit's own fakes (11
+- **Tests:** `.venv/bin/python -m pytest -q ~/follower_code/quest/tests` runs them over the kit's own fakes (14
   pass). The kit's own suite still passes.
-- **Not tested:** a real Quest or real arms.
+- **Not tested:** a real Quest. The gravity model is proven on the arms through the leader/follower, not yet through this launcher.
 
 ## Metal stations: `metal/leader_collect.py`
 
@@ -68,7 +69,7 @@ cd ~/physical-ai-hacks
 - **Dry run:** both arms open with torque off. Nothing is energized and the leader is limp, so support it.
 - **Tests:** `cd ~/physical-ai-hacks && .venv/bin/python -m pytest -q ~/follower_code/metal/tests` runs the kit's
   real Collector and writer over fake Metal devices, then runs `tools/add_eef.py`, which applies Dream's dataset
-  checks. All 6 pass on the hackathon NUC.
+  checks. All 10 pass on the hackathon NUC.
 - **Not covered by the tests:** the real arms. Gravity compensation, how the leader feels and the follower's lag
   are untested until a dry run and a real run on hardware.
 

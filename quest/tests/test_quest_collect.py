@@ -195,3 +195,53 @@ def test_heading_math_round_trips():
         np.testing.assert_allclose(mapped / np.linalg.norm(mapped), [1, 0, 0], atol=1e-9)
     with pytest.raises(ValueError):
         qc.heading_from_move(np.array([0.0, 0.3, 0.02]), q2b)    # straight up: no heading in it
+
+
+class _Bus:
+    def __init__(self):
+        self.sent = []
+
+    def sync_write_metal(self, commands):
+        self.sent.append(commands)
+
+
+def _opened_with_gravity(arm, energize):
+    import types
+
+    from dream_hackathon.arms.makermods import MOTORS
+
+    robot = types.SimpleNamespace(_devices={"left": types.SimpleNamespace(bus=_Bus())})
+    opened = qc._with_gravity(lambda station, *, energize, sim=False: robot)(
+        types.SimpleNamespace(arm=arm), energize=energize)
+    bus = opened._devices["left"].bus
+    pose_deg = [10.0, -40.0, 60.0, -20.0, 5.0, 0.0]
+    bus.sync_write_metal({m: (40.0, 1.0, d, 0.0, 0.0) for m, d in zip(MOTORS, pose_deg)})
+    return MOTORS, pose_deg, bus.sent[-1]
+
+
+def test_gravity_is_on_by_default_and_uses_the_makermods_model(monkeypatch):
+    pytest.importorskip("pinocchio")
+    from lerobot.teleoperators.metal_leader.gravity import MetalGravityModel
+    from lerobot.teleoperators.metal_leader.urdf import metal_urdf_path
+
+    seen = {}
+    monkeypatch.setattr(qc, "install", lambda **kw: seen.update(kw))
+    monkeypatch.setattr(qc.collect, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(qc.collect, "choose_task", lambda *a: "t")
+    monkeypatch.setattr(qc.config, "load", lambda path: __import__("types").SimpleNamespace(task="t"))
+    monkeypatch.setattr(qc, "tuned_station", lambda station, hz, speed: station)
+    qc.main(["--config", str(pathlib.Path(__file__))])
+    assert seen["gravity_ff"] is True
+    qc.main(["--config", str(pathlib.Path(__file__)), "--no-gravity-ff"])
+    assert seen["gravity_ff"] is False
+
+    motors, pose_deg, sent = _opened_with_gravity("metal", energize=True)
+    want = MetalGravityModel(str(metal_urdf_path())).feedforward_torque([math.radians(d) for d in pose_deg], [0.0] * 6)
+    np.testing.assert_allclose([sent[m][4] for m in motors], want, atol=1e-9)
+    assert any(abs(t) > 0.1 for t in want)
+
+
+@pytest.mark.parametrize(("arm", "energize"), [("metal", False), ("yam", True)])
+def test_no_gravity_on_a_dry_run_or_other_arms(arm, energize):
+    motors, _, sent = _opened_with_gravity(arm, energize)
+    assert all(sent[m][4] == 0.0 for m in motors)

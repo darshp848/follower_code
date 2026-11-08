@@ -16,9 +16,10 @@ for this process only; none of the kit's files change:
 - **The IK** (laggy, jittery): the loop runs at `--control-hz` (60, against the kit's 30), the joint speed cap is
   `--max-joint-speed` (2.5 rad/s, against 1.5), and the solver's damping is raised (`--ik-damping`), which stops the
   joints chattering near singular poses.
-- **Gravity feedforward** (Metal only, `--gravity-ff`, off by default): fills each joint's model gravity torque into
-  the follower's MIT frames, so the tool stops sitting 2.5 to 6.5 cm under its target. Adapted from Daniel's
-  `teleop-tuning` kit branch (GravityFeedforward); not yet run on hardware.
+- **Gravity feedforward** (Metal only, on by default, `--no-gravity-ff` turns it off): fills each joint's gravity
+  torque into the follower's MIT frames, so the arm stops sitting under its target (shoulder_lift 4 to 6 deg low
+  without it). It is metal/leader_collect.py's FollowerGravity, MakerMods' own Metal model, which took the
+  leader/follower episodes' shoulder_lift bias from +4.5 to +0.2 deg on the station's arms.
 
     cd ~/physical-ai-hacks
     .venv/bin/python ~/follower_code/quest/quest_collect.py --config configs/station.yaml --dry-run
@@ -322,58 +323,28 @@ class QuestCollector(collect.Collector):
 
 
 # ------------------------------------------------------------------------------------------------ gravity
-## Per Metal joint, the factor on its model gravity torque (Dream's Metal driver's, from MakerMods' SDK).
-GRAVITY_FACTORS = (1.2, 1.15, 1.1, 1.15, 1.0, 1.0)
+def _follower_gravity() -> Any:
+    """metal/leader_collect.py's FollowerGravity: MakerMods' Metal gravity model, proven on the station's arms."""
+    metal = str(pathlib.Path(__file__).resolve().parents[1] / "metal")
+    if metal not in sys.path:
+        sys.path.append(metal)
+    from leader_collect import FollowerGravity
 
-
-class GravityFeedforward:
-    """Fills each Metal arm joint's gravity torque into a follower's MIT frames (`bus.sync_write_metal`).
-
-    Adapted from the kit's `teleop-tuning` branch (Daniel, 745535d, Apache-2.0): the torque is the URDF model's at
-    the frame's target angles times GRAVITY_FACTORS; a frame without all six arm joints goes out unchanged.
-    """
-
-    def __init__(self, bus: Any, model: Any, joint_names: tuple[str, ...], joint_signs: tuple[float, ...]) -> None:
-        import mujoco
-
-        from dream_hackathon.arms.makermods import MOTORS
-
-        self._mujoco, self._motors = mujoco, MOTORS
-        self._model, self._data = model, mujoco.MjData(model)
-        ids = [model.joint(name).id for name in joint_names]
-        self._qpos = np.array([model.jnt_qposadr[i] for i in ids])
-        self._dof = np.array([model.jnt_dofadr[i] for i in ids])
-        self._signs = np.asarray(joint_signs, float)
-        self._factors = np.asarray(GRAVITY_FACTORS, float)
-        self._send = bus.sync_write_metal
-        bus.sync_write_metal = self.sync_write_metal
-
-    def torques_nm(self, motor_deg: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-        self._data.qpos[:] = self._model.qpos0
-        self._data.qpos[self._qpos] = np.radians(motor_deg) * self._signs
-        self._data.qvel[:] = 0.0
-        self._mujoco.mj_forward(self._model, self._data)
-        return self._data.qfrc_bias[self._dof] * self._signs * self._factors
-
-    def sync_write_metal(self, commands: dict[str, tuple[float, float, float, float, float]]) -> Any:
-        if not all(motor in commands for motor in self._motors):
-            return self._send(commands)
-        torques = self.torques_nm(np.array([commands[m][2] for m in self._motors], float))
-        frames = dict(commands)
-        for motor, torque in zip(self._motors, torques, strict=True):
-            kp, kd, position, velocity, _ = commands[motor]
-            frames[motor] = (kp, kd, position, velocity, float(torque))
-        return self._send(frames)
+    return FollowerGravity
 
 
 def _with_gravity(open_arms: Any) -> Any:
     def opened(station: config.StationConfig, *, energize: bool, sim: bool = False) -> Any:
+        if not (energize and not sim and station.arm == "metal"):
+            return open_arms(station, energize=energize, sim=sim)
+        # The model loads before the arms energize, so a missing URDF or Pinocchio stops here with torque off.
+        from lerobot.teleoperators.metal_leader.gravity import MetalGravityModel
+        from lerobot.teleoperators.metal_leader.urdf import metal_urdf_path
+
+        follower_gravity, model = _follower_gravity(), MetalGravityModel(str(metal_urdf_path()))
         robot = open_arms(station, energize=energize, sim=sim)
-        if energize and station.arm == "metal":
-            mm = station.makermods
-            model = ik.urdf_model(mm.urdf.read_text(), mm.flange_link, (0.0, 0.0, 0.0))
-            for device in robot._devices.values():
-                GravityFeedforward(device.bus, model, mm.urdf_joints, mm.joint_signs)
+        for device in robot._devices.values():
+            follower_gravity(device.bus, model)
         return robot
     return opened
 
@@ -417,7 +388,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--filter-beta", type=float, default=10.0, help="higher is less lag when moving fast")
     p.add_argument("--ik-damping", type=float, default=1e-2)
     p.add_argument("--orientation-cost", type=float, default=0.5)
-    p.add_argument("--gravity-ff", action="store_true", help="Metal: gravity torque feedforward (untested on arms)")
+    p.add_argument("--gravity-ff", action=argparse.BooleanOptionalAction, default=True,
+                   help="Metal: gravity torque in the follower's frames (on by default; --no-gravity-ff turns it off)")
     p.add_argument("--reset-heading", action="store_true", help="forget the saved heading calibration")
     a = p.parse_args(argv)
     if a.reset_heading:
