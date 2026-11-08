@@ -1,5 +1,10 @@
 # follower_code
 
+> **Two recorders here, one per arm type.**
+> - `metal/leader_collect.py`: MakerMods **Metal** stations, such as the MakerMods Physical AI Hackathon kit. Start
+>   here on those.
+> - `leader_follower.py`: i2rt **YAM** arms. It refuses to run unless `~/.dreamlabs/station.yaml` says `body: yam`.
+
 ## Metal stations: `metal/leader_collect.py`
 
 One Metal arm is the leader, running MakerMods' gravity-compensated `metal_leader` (kp 0, Pinocchio gravity and
@@ -33,11 +38,6 @@ cd ~/physical-ai-hacks
   are untested until a dry run and a real run on hardware.
 
 ## YAM arms: `leader_follower.py`
-
-> **Two recorders here, one per arm type.**
-> - `metal/leader_collect.py`: MakerMods **Metal** stations, such as the MakerMods Physical AI Hackathon kit. Start
->   here on those.
-> - `leader_follower.py`: i2rt **YAM** arms. It refuses to run unless `~/.dreamlabs/station.yaml` says `body: yam`.
 
 Leader/follower teleoperation and demo recording for a pair of YAM arms driven by
 [i2rt](https://github.com/i2rt-robotics/i2rt).
