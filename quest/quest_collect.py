@@ -309,6 +309,7 @@ HOME_CONFIRM_S = 2.0
 ## Homing first lifts a tool lower than its home height up to it, for at most this long, then moves the joints home.
 LIFT_TIMEOUT_S = 4.0
 LIFT_TOLERANCE_M = 0.01
+LIFT_SPEED_M_S = 0.10
 
 
 class _RecordingHeadset:
@@ -356,7 +357,7 @@ class QuestCollector(collect.Collector):
                 clutch.on_engage = solver.reset_guard
         self._home_asked_s: float | None = None
         self._home_started_s: float | None = None
-        self._lift: dict[str, npt.NDArray[np.float64]] | None = None
+        self._lift: dict[str, tuple[npt.NDArray[np.float64], float]] | None = None
         self._lift_deadline_s = 0.0
         self._log(f"quest heading {math.degrees(self._heading):+.0f} deg "
                   f"({'saved' if t.heading_file.exists() else 'not calibrated: press Y, move, Y'}); "
@@ -386,18 +387,18 @@ class QuestCollector(collect.Collector):
                 solver = self._iks[side]
                 tool, home = solver.fk(self._command.joints[side]), solver.fk(start)
                 if tool[2, 3] < home[2, 3] - LIFT_TOLERANCE_M:
-                    target = tool.copy()
-                    target[2, 3] = home[2, 3]
-                    self._lift[side] = target
+                    # (the tool where it is, the height to reach); the target rises at LIFT_SPEED_M_S, a straight line
+                    self._lift[side] = (tool.copy(), float(home[2, 3]))
             self._lift_deadline_s = time.monotonic() + LIFT_TIMEOUT_S
         if self._lift and time.monotonic() < self._lift_deadline_s:
-            for side, target in list(self._lift.items()):
+            for side, (target, top_z) in list(self._lift.items()):
                 solver = self._iks[side]
                 guard = getattr(solver, "flip_guard", None)
                 if guard is not None:
                     guard.reset()
+                target[2, 3] = min(top_z, target[2, 3] + LIFT_SPEED_M_S * self._dt_s)
                 self._command.joints[side] = solver.step(target, self._command.joints[side], self._dt_s)
-                if solver.fk(self._command.joints[side])[2, 3] >= target[2, 3] - LIFT_TOLERANCE_M:
+                if solver.fk(self._command.joints[side])[2, 3] >= top_z - LIFT_TOLERANCE_M:
                     del self._lift[side]
             return
         super()._step_home()
