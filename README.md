@@ -56,8 +56,15 @@ cd ~/physical-ai-hacks
 - **What's recorded for the leader's side:** its *parked* pose by default, because at deploy time that arm stays
   parked. `--record-leader` records its real motion instead. The left wrist camera still shows the leader and your
   hand.
-- **Follower motion:** the follower closes the gap to the leader at 0.4 rad/s, then follows at the config's
-  `teleop.max_joint_speed_rad_s`. If it falls more than 0.35 rad behind, the kit re-syncs it.
+- **Follower motion:** the follower closes the gap to the leader at 0.4 rad/s, for at most 3 s, then follows at
+  `--follow-speed` (4 rad/s; MakerMods' 280°/s follower cap still applies). If it falls more than 0.35 rad behind,
+  the kit re-syncs it.
+- **Gravity feedforward (on by default):** without it, every joint sits under its command by its gravity torque
+  over kp. The first real episodes showed shoulder_lift +4 to +6° and elbow_flex +2.5 to +4.3° on average, and the
+  old 1.5 rad/s cap was hit on every joint. The follower's MIT frames now carry MakerMods' own Metal gravity torque
+  (the leader's model). `--no-gravity-ff` turns it off.
+- **Checking tracking:** `.venv/bin/python ~/follower_code/metal/tools/tracking_report.py <dataset>` prints the
+  per-joint error of any recorded dataset.
 - **Dry run:** both arms open with torque off. Nothing is energized and the leader is limp, so support it.
 - **Tests:** `cd ~/physical-ai-hacks && .venv/bin/python -m pytest -q ~/follower_code/metal/tests` runs the kit's
   real Collector and writer over fake Metal devices, then runs `tools/add_eef.py`, which applies Dream's dataset

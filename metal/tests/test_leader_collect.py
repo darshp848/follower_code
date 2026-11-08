@@ -43,12 +43,18 @@ class FakeBus:
     def read(self, register, motor):
         return self.device.deg[motor]
 
+    def sync_write_metal(self, commands):
+        """The MIT write MetalFollower.send_action uses (velocity_feedforward on): (kp, kd, deg, deg/s, N.m)."""
+        self.device.frames.append(commands)
+        for motor, (_kp, _kd, position, _v, _t) in commands.items():
+            self.device.deg[motor] += 0.6 * (position - self.device.deg[motor])
+
 
 class FakeFollower:
-    """MetalFollower: send_action moves the arm 60% of the way each call (a lagging servo)."""
+    """MetalFollower: each frame moves the arm 60% of the way (a lagging servo), through bus.sync_write_metal."""
 
     def __init__(self, cfg):
-        self.cfg, self.deg, self.torque, self.sent = cfg, dict(FOLLOWER_START), True, []
+        self.cfg, self.deg, self.torque, self.sent, self.frames = cfg, dict(FOLLOWER_START), True, [], []
         self.bus = FakeBus(self)
 
     def connect(self, calibrate=False):
@@ -59,9 +65,7 @@ class FakeFollower:
 
     def send_action(self, action):
         self.sent.append(action)
-        for key, value in action.items():
-            m = key[:-4]
-            self.deg[m] += 0.6 * (value - self.deg[m])
+        self.bus.sync_write_metal({key[:-4]: (100.0, 5.0, value, 0.0, 0.0) for key, value in action.items()})
 
     def disconnect(self):
         pass
@@ -71,8 +75,9 @@ class FakeLeader:
     """MetalLeader: the 'operator' moves it along a script, one step per get_action."""
 
     def __init__(self, cfg):
-        self.cfg, self.deg, self.k, self.torque = cfg, dict(LEADER_START), 0, True
+        self.cfg, self.deg, self.k, self.torque, self.frames = cfg, dict(LEADER_START), 0, True, []
         self.bus = FakeBus(self)
+        self.speed = 1.0
 
     def connect(self, calibrate=True):
         pass
@@ -80,7 +85,7 @@ class FakeLeader:
     def get_action(self):
         self.k += 1
         t = self.k / 30.0
-        self.deg["shoulder_pan"] = LEADER_START["shoulder_pan"] + 20 * math.sin(0.8 * t)
+        self.deg["shoulder_pan"] = LEADER_START["shoulder_pan"] + 20 * math.sin(0.8 * self.speed * t)
         self.deg["elbow_flex"] = LEADER_START["elbow_flex"] + 15 * math.sin(0.5 * t)
         self.deg["gripper"] = 5.0 + 50.0 * (0.5 + 0.5 * math.sin(0.6 * t))
         return {f"{m}.pos": v for m, v in self.deg.items()}
@@ -185,7 +190,7 @@ def test_records_follower_tracking_leader_with_leader_parked(station):
     # The follower's action tracks the leader, within one tick of the configured joint speed.
     assert np.ptp(action[:, 7]) > np.radians(15)
     step = np.abs(np.diff(action[:, 7:13], axis=0)).max()
-    assert step <= st.teleop.max_joint_speed_rad_s / st.control_hz + 1e-6
+    assert step <= lc.LeaderCollector.follow_speed_rad_s / st.control_hz + 1e-6
     # The follower's gripper action follows the leader's stroke fraction (mm on a 100 mm scale).
     assert np.ptp(action[:, 13]) > 20
     robot.close()
@@ -261,3 +266,70 @@ def test_dataset_passes_dreams_checks(station, tmp_path):
     assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-2000:]
     info = json.loads((st.dataset_dir.parent / f"{st.dataset_dir.name}-eef" / "meta" / "info.json").read_text())
     assert info["codebase_version"] == "v2.1" and info["fps"] == 30
+
+
+def test_follower_frames_carry_metal_gravity_torque(station):
+    """The arm joints' torque field is MakerMods' Metal gravity model at the frame's targets; the gripper's is not."""
+    from lerobot.teleoperators.metal_leader.gravity import MetalGravityModel
+    from lerobot.teleoperators.metal_leader.urdf import metal_urdf_path
+
+    st, _ = station
+    robot = lc.LeaderFollowerArms(st, energize=True, leader="left", record_leader=False)
+    c = _collector(st, robot, lc.KeyboardHeadset(io.StringIO("")), [])
+    for _ in range(30):
+        c.tick()
+    frame = robot._devices["right"].frames[-1]
+    model = MetalGravityModel(str(metal_urdf_path()))
+    want = model.feedforward_torque([math.radians(frame[m][2]) for m in lc.MOTORS], [0.0] * 6)
+    got = [frame[m][4] for m in lc.MOTORS]
+    np.testing.assert_allclose(got, want, atol=1e-9)
+    assert abs(got[1]) > 0.5 or abs(got[2]) > 0.5          # the shoulder or elbow carries real weight
+    assert frame["gripper"][4] == 0.0
+    robot.close()
+
+
+def test_no_gravity_ff_sends_zero_torque(station):
+    st, _ = station
+    robot = lc.LeaderFollowerArms(st, energize=True, leader="left", record_leader=False, gravity_ff=False)
+    c = _collector(st, robot, lc.KeyboardHeadset(io.StringIO("")), [])
+    for _ in range(5):
+        c.tick()
+    assert all(v[4] == 0.0 for v in robot._devices["right"].frames[-1].values())
+    robot.close()
+
+
+def test_a_leader_that_keeps_moving_fast_is_still_followed(station):
+    """The old catch-up waited to be within 0.05 rad at 0.4 rad/s, which a leader moving faster never allows."""
+    st, _ = station
+    logs = []
+    robot = lc.LeaderFollowerArms(st, energize=True, leader="left", record_leader=False)
+    robot._devices["left"].speed = 3.0                       # shoulder_pan swings at up to 0.84 rad/s
+    c = _collector(st, robot, lc.KeyboardHeadset(io.StringIO("")), logs)
+    for _ in range(int(30 * (lc.ENGAGE_MAX_S + 0.5))):
+        c.tick()
+    assert c._engaged, logs
+    gaps = []
+    for _ in range(90):
+        c.tick()
+        gaps.append(float(np.max(np.abs(robot.leader_joints - c._command.joints["right"]))))
+    assert max(gaps) < np.radians(1.0), np.degrees(max(gaps))   # the command keeps up with the leader
+    robot.close()
+
+
+def test_tracking_report_reads_an_episode(station):
+    import subprocess
+
+    st, _ = station
+    robot = lc.LeaderFollowerArms(st, energize=True, leader="left", record_leader=False)
+    headset = lc.KeyboardHeadset(io.StringIO(""))
+    c = _collector(st, robot, headset, [])
+    headset.press("A")
+    for _ in range(70):
+        c.tick()
+    headset.press("A")
+    c.tick()
+    robot.close()
+    tool = pathlib.Path(__file__).resolve().parents[1] / "tools" / "tracking_report.py"
+    out = subprocess.run([sys.executable, str(tool), str(st.dataset_dir)], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert "shoulder_lift" in out.stdout and "episode_000000" in out.stdout

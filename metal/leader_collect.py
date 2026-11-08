@@ -20,6 +20,13 @@ What is recorded for the leader's side: by default its PARKED pose (where it was
 leader's real motion would teach a model to move it. Each episode's task text is unchanged; the session prints the
 choice. `--record-leader` records the leader's measured joints instead.
 
+Tracking (measured on the first recorded episodes, with the kit's follower as it is): each joint sat under its
+command by its gravity torque over kp (shoulder_lift +4 to +6 deg, elbow_flex +2.5 to +4.3 deg on average), and
+the kit's 1.5 rad/s teleop cap was hit on every joint, so the command trailed the leader. Hence, by default: the
+follower's frames carry MakerMods' Metal gravity torque (`--no-gravity-ff` turns it off), and the command cap is
+`--follow-speed` 4 rad/s (MakerMods' 280 deg/s follower cap still applies). `metal/tools/tracking_report.py` prints
+the per-joint error of any recorded dataset, to check a change.
+
 The dry run opens both arms with torque off (the kit's dry run): nothing is energized, the leader is limp, so
 support it; the follower's command (shown on the dashboard) follows the leader and is never sent.
 """
@@ -47,8 +54,15 @@ _log = logging.getLogger(__name__)
 
 ## While the follower is still far from the leader (just after the arms open), it closes the gap this slowly.
 ENGAGE_SPEED_RAD_S = 0.4
-## The follower counts as caught up, and moves at the config's teleop speed, once every joint is this close.
+## The follower counts as caught up, and moves at the follow speed, once every joint is this close ...
 ENGAGED_WITHIN_RAD = 0.05
+## ... or after this long catching up: a leader that keeps moving faster than ENGAGE_SPEED_RAD_S is never "close",
+## and the follower must not crawl behind it for the rest of the session.
+ENGAGE_MAX_S = 3.0
+## The follower's command speed cap once engaged. The kit's teleop cap (1.5 rad/s = 86 deg/s) was hit on every
+## joint in every recorded episode, so the follower's target trailed the leader; MakerMods' own follower speed cap
+## (280 deg/s = 4.9 rad/s, installed by prepare_leader_following) still applies under this.
+FOLLOW_SPEED_RAD_S = 4.0
 
 
 class LeaderFollowerArms:
@@ -60,7 +74,8 @@ class LeaderFollowerArms:
     - leader_joints, leader_grip: The leader's measured joints and gripper, refreshed by read().
     """
 
-    def __init__(self, station: config.StationConfig, *, energize: bool, leader: str, record_leader: bool) -> None:
+    def __init__(self, station: config.StationConfig, *, energize: bool, leader: str, record_leader: bool,
+                 gravity_ff: bool = True) -> None:
         from lerobot.robots.metal_follower import MetalFollower, MetalFollowerConfig
         from makermodslab.arms import METAL
 
@@ -69,6 +84,8 @@ class LeaderFollowerArms:
         mm = station.makermods
         assert mm is not None
         self.energized = energize
+        self._gravity_ff = gravity_ff
+        self.gravity: FollowerGravity | None = None
         self.leader, self.follower = leader, ("right" if leader == "left" else "left")
         self._record_leader = record_leader
         self._arms = station.arms
@@ -156,18 +173,74 @@ class LeaderFollowerArms:
         metal_gripper.install_metal_gripper(device, "")
         self._family.prepare_teleoperation(device)
         self._family.prepare_leader_following(device)
+        if self._gravity_ff:
+            # Before connect: the model loads first, so a missing URDF or Pinocchio stops here with torque off.
+            self.gravity = FollowerGravity(device.bus)
         try:
             device.connect(calibrate=False)
         except BaseException:
             torque.de_energize_can_device(device, "follower arm")
             raise
 
+    _last_dry: dict = {}
+
     def _read_degrees(self, side: str) -> dict[str, float]:
         device = self._devices[side]
         if not self.energized:
-            return {m: float(device.bus.read("Present_Position", m)) for m in (*MOTORS, GRIPPER)}
+            # One motor at a time on a busy bus: a missed reply is retried, then the last value stands in.
+            last = self._last_dry.setdefault(side, {})
+            out = {}
+            for m in (*MOTORS, GRIPPER):
+                for _ in range(3):
+                    try:
+                        out[m] = last[m] = float(device.bus.read("Present_Position", m))
+                        break
+                    except ConnectionError:
+                        continue
+                else:
+                    if m not in last:
+                        raise ConnectionError(f"{side} arm: motor {m!r} never answered")
+                    out[m] = last[m]
+            return out
         reading = device.get_action() if side == self.leader else device.get_observation()
         return {m: float(reading[f"{m}.pos"]) for m in (*MOTORS, GRIPPER)}
+
+
+class FollowerGravity:
+    """Puts each arm joint's gravity torque into the Metal follower's MIT frames (`bus.sync_write_metal`).
+
+    The pinned MetalFollower sends every frame with a zero torque field, so each joint sits under its target by its
+    gravity torque over kp: the recorded episodes showed shoulder_lift 4 to 6 deg and elbow_flex 2.5 to 4.3 deg under
+    the command on average (Dream's own Metal driver notes the same, "the shoulder sits 0.1 rad under its target",
+    and sends gravity torque). The torque is MakerMods' own Metal model (`MetalGravityModel`, the metal_leader's,
+    which matches Dream's `robots.metal.gravity_nm` to 0.01 N.m), at the frame's target angles. Frames without all
+    six arm joints (the gripper's own) go out unchanged, and the gripper's entry is never touched.
+    """
+
+    def __init__(self, bus: Any, model: Any = None) -> None:
+        if model is None:
+            from lerobot.teleoperators.metal_leader.gravity import MetalGravityModel
+            from lerobot.teleoperators.metal_leader.urdf import metal_urdf_path
+
+            model = MetalGravityModel(str(metal_urdf_path()))
+        self._model = model
+        self._send = bus.sync_write_metal
+        bus.sync_write_metal = self.sync_write_metal
+        self.frames = 0
+        self.last_nm: list[float] = [0.0] * len(MOTORS)
+
+    def sync_write_metal(self, commands: dict[str, tuple[float, float, float, float, float]]) -> Any:
+        if not all(motor in commands for motor in MOTORS):
+            return self._send(commands)
+        q_rad = [math.radians(commands[m][2]) for m in MOTORS]
+        torques = self._model.feedforward_torque(q_rad, [0.0] * len(MOTORS))
+        frames = dict(commands)
+        for motor, torque in zip(MOTORS, torques, strict=True):
+            kp, kd, position, velocity, _ = commands[motor]
+            frames[motor] = (kp, kd, position, velocity, float(torque))
+        self.frames += 1
+        self.last_nm = [float(t) for t in torques]
+        return self._send(frames)
 
 
 def _metal_leader(cfg: Any) -> Any:
@@ -218,19 +291,27 @@ class KeyboardHeadset:
 class LeaderCollector(collect.Collector):
     """The kit's Collector with the leader arm in place of the Quest's clutch."""
 
+    follow_speed_rad_s: float = FOLLOW_SPEED_RAD_S
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._engaged = False
+        self._catching_up_s = 0.0
 
     def _follow(self, state: quest.QuestState, measured: Joints) -> None:
         robot: LeaderFollowerArms = self._robot  # type: ignore[assignment]
         side = robot.follower
         joints = self._command.joints[side]
         gap = robot.leader_joints - joints
-        if not self._engaged and float(np.max(np.abs(gap))) <= ENGAGED_WITHIN_RAD:
-            self._engaged = True
-            self._log(f"{side} arm is following the {robot.leader} arm")
-        speed = self._station.teleop.max_joint_speed_rad_s if self._engaged else ENGAGE_SPEED_RAD_S
+        if not self._engaged:
+            self._catching_up_s += self._dt_s
+            close = float(np.max(np.abs(gap))) <= ENGAGED_WITHIN_RAD
+            if close or self._catching_up_s >= ENGAGE_MAX_S:
+                self._engaged, self._catching_up_s = True, 0.0
+                self._log(f"{side} arm is following the {robot.leader} arm"
+                          + ("" if close else f" (still {np.degrees(np.max(np.abs(gap))):.0f} deg apart after "
+                                              f"{ENGAGE_MAX_S:.0f} s: closing it at full speed)"))
+        speed = self.follow_speed_rad_s if self._engaged else ENGAGE_SPEED_RAD_S
         self._command.joints[side] = teleop.step_toward(joints, robot.leader_joints, speed * self._dt_s)
         # The leader's gripper as a fraction of its own stroke, onto the follower's stroke (open = 1).
         self._command.grips[side] = robot.leader_grip
@@ -251,8 +332,10 @@ class LeaderCollector(collect.Collector):
 
 
 def run(station: config.StationConfig, task: str, *, dry_run: bool, leader: str, record_leader: bool,
-        dashboard_port: int = dashboard.DEFAULT_PORT, keys: Any = None) -> None:
+        dashboard_port: int = dashboard.DEFAULT_PORT, keys: Any = None, gravity_ff: bool = True,
+        follow_speed_rad_s: float = FOLLOW_SPEED_RAD_S) -> None:
     """collect.run() and collect._run_locked() with the leader arm and the keyboard in place of the Quest."""
+    LeaderCollector.follow_speed_rad_s = follow_speed_rad_s
     iks = arms.open_ik(station)
 
     def make_writer() -> dataset.DatasetWriter:
@@ -269,6 +352,8 @@ def run(station: config.StationConfig, task: str, *, dry_run: bool, leader: str,
         found = devices.DeviceSet(station, quest_ip="keyboard", open_quest=lambda _ip: headset)
         recorded = "its measured motion" if record_leader else "its parked pose (where it was when the arms opened)"
         collect._say(f"{leader} arm leads, the other follows; the leader's side records {recorded}")
+        collect._say(f"follower: {np.degrees(follow_speed_rad_s):.0f} deg/s command cap, gravity feedforward "
+                     f"{'on' if gravity_ff else 'OFF'}, {station.control_hz} Hz loop")
 
         def frame(role: str) -> Any:
             camera = found.cameras.get(role)
@@ -302,7 +387,8 @@ def run(station: config.StationConfig, task: str, *, dry_run: bool, leader: str,
                 robot = collect.wait_and_open_arms(
                     station, found, board, log, dry_run=dry_run, sim=False, reported=reported,
                     open_arms=lambda st, energize, sim: LeaderFollowerArms(st, energize=energize, leader=leader,
-                                                                           record_leader=record_leader))
+                                                                           record_leader=record_leader,
+                                                                           gravity_ff=gravity_ff))
             except KeyboardInterrupt:
                 log("session ended before the arms were opened")
                 return
@@ -345,16 +431,27 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--record-leader", action="store_true",
                         help="record the leader's measured joints instead of its parked pose")
     parser.add_argument("--dashboard-port", type=int, default=dashboard.DEFAULT_PORT)
+    parser.add_argument("--follow-speed", type=float, default=FOLLOW_SPEED_RAD_S,
+                        help=f"rad/s cap on the follower's command once engaged (default {FOLLOW_SPEED_RAD_S}; "
+                             "the kit's teleop cap is 1.5)")
+    parser.add_argument("--no-gravity-ff", action="store_true",
+                        help="send the follower's frames with zero torque, as the kit does (the arm sags)")
+    parser.add_argument("--control-hz", type=int, help="loop rate, a multiple of fps (default: the config's)")
     args = parser.parse_args(argv)
     try:
         station = config.load(args.config)
+        if args.control_hz:
+            if args.control_hz % station.fps:
+                raise config.ConfigError(f"--control-hz {args.control_hz} must be a multiple of fps {station.fps}")
+            station = dataclasses.replace(station, control_hz=args.control_hz)
     except config.ConfigError as error:
         sys.exit(f"config: {error}")
     if args.dataset_dir:
         station = dataclasses.replace(station, dataset_dir=pathlib.Path(args.dataset_dir).expanduser())
     try:
         run(station, collect.choose_task(args.task, station.task), dry_run=args.dry_run, leader=args.leader,
-            record_leader=args.record_leader, dashboard_port=args.dashboard_port)
+            record_leader=args.record_leader, dashboard_port=args.dashboard_port,
+            gravity_ff=not args.no_gravity_ff, follow_speed_rad_s=args.follow_speed)
     except (station_lock.StationBusyError, arms.ArmsError) as error:
         sys.exit(str(error))
     except config.ConfigError as error:
