@@ -322,14 +322,18 @@ def test_homing_lifts_a_low_tool_before_moving_the_joints(tmp_path):
     low = _tool(c, arms)[:3, 3].copy()
     assert low[2] < home_z - 0.04
     headset.press.add("RJ")
-    heights, sideways = [], []
+    lift, lowest, lifted = [low[2]], low[2], False
+    sideways = []
     for _ in range(60 * 15):
         c.tick()
         tool = _tool(c, arms)[:3, 3]
-        heights.append(tool[2])
-        if tool[2] < home_z - 0.01:                   # still lifting: the tool moves straight up
+        lowest = min(lowest, tool[2])
+        lifted = lifted or tool[2] >= home_z - 0.01
+        if not lifted:                                # the lift: straight up, never down
+            lift.append(tool[2])
             sideways.append(np.linalg.norm(tool[:2] - low[:2]))
-    assert not c.homing
-    assert np.all(np.diff(heights[:30]) > -1e-4)      # it starts by going up, never down
-    assert max(sideways) < 0.01
+    assert not c.homing and lifted
+    assert np.all(np.diff(lift) > -1e-4)
+    assert sideways and max(sideways) < 0.01
+    assert lowest >= low[2] - 1e-4                    # never pushed lower than where homing started
     np.testing.assert_allclose(arms.joints["right"], arms.start_joints["right"], atol=2e-3)
