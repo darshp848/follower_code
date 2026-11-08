@@ -337,3 +337,32 @@ def test_homing_lifts_a_low_tool_before_moving_the_joints(tmp_path):
     assert sideways and max(sideways) < 0.01
     assert lowest >= low[2] - 1e-4                    # never pushed lower than where homing started
     np.testing.assert_allclose(arms.joints["right"], arms.start_joints["right"], atol=2e-3)
+
+
+def test_a_home_press_does_not_carry_over_to_the_next_episode(tmp_path):
+    c, arms, headset = _moved_away(tmp_path, [])
+    headset.press.add("A")
+    c.tick()
+    headset.press.add("RJ")                            # asks to confirm on episode 1
+    c.tick()
+    headset.press.add("A")                             # saves episode 1
+    c.tick()
+    headset.press.add("A")                             # starts episode 2
+    c.tick()
+    headset.press.add("RJ")                            # must ask again, not discard episode 2
+    c.tick()
+    assert c.episode is not None and not c.homing
+
+
+def test_a_lift_that_cannot_arrive_stops_homing_instead_of_moving_the_joints(tmp_path, monkeypatch):
+    logs = []
+    c, arms, headset = _moved_away(tmp_path, logs)
+    monkeypatch.setattr(qc, "LIFT_TIMEOUT_S", 0.0)
+    c._lift = {"right": (np.eye(4), 10.0)}             # a height it can never reach
+    c._lift_deadline_s = 0.0
+    c.homing = True
+    before = c._command.joints["right"].copy()
+    c.tick()
+    assert not c.homing
+    np.testing.assert_allclose(c._command.joints["right"], before)
+    assert any("could not lift" in line for line in logs), logs

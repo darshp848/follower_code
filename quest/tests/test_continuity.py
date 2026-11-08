@@ -73,3 +73,19 @@ def test_jump_guard_flags_glitches_not_moves():
 def test_per_joint_caps():
     np.testing.assert_allclose(per_joint_caps(2.5, 4.0), [2.5, 2.5, 2.5, 4.0, 4.0, 4.0])
     np.testing.assert_allclose(per_joint_caps(2.5, None), [2.5] * 6)
+
+
+def _rx(deg):
+    c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    pose = np.eye(4)
+    pose[:3, :3] = [[1, 0, 0], [0, c, -s], [0, s, c]]
+    return pose
+
+
+def test_after_a_rebase_hand_turns_keep_their_base_frame_axis():
+    # Found in review: an offset on the left turned a later 10 deg turn about base x into one about base -y.
+    guard = WristFlipGuard()
+    tool, hand = np.eye(4), _rz(90)
+    guard.rebase(tool, hand)
+    turned = guard.apply(_rx(10) @ hand)              # the hand turns 10 deg about base x
+    np.testing.assert_allclose(turned[:3, :3], _rx(10)[:3, :3] @ tool[:3, :3], atol=1e-12)

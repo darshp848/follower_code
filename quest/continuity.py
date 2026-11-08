@@ -26,9 +26,9 @@ def rotation_angle_deg(rotation: npt.NDArray[np.float64]) -> float:
 class WristFlipGuard:
     """Detects wrist self-motion (wrist joints turning a lot, tool barely turning) and re-anchors the orientation.
 
-    The guard owns an orientation offset applied to every target: `target_used = offset @ target` (base frame).
-    On a flip, the offset is set so the target's orientation equals the tool's orientation now; from then on the
-    hand's further turns act from there. reset() (at every engage) clears it.
+    The guard owns an orientation offset applied to every target: `target_used = target @ offset`. On a flip, the
+    offset is set so the target's orientation equals the tool's orientation now; the offset is on the right, so the
+    hand's further turns still act about the same base-frame axes, from there. reset() (at every engage) clears it.
 
     @param window_s The look-back window.
     @param min_travel_deg Wrist travel (sum of |step| over the wrist joints) in the window that can count as a flip.
@@ -48,7 +48,7 @@ class WristFlipGuard:
 
     def apply(self, target: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         out = np.array(target, dtype=np.float64, copy=True)
-        out[:3, :3] = self.offset @ out[:3, :3]
+        out[:3, :3] = out[:3, :3] @ self.offset
         return out
 
     def observe(self, joints_before: npt.ArrayLike, joints_after: npt.ArrayLike,
@@ -65,7 +65,7 @@ class WristFlipGuard:
 
     def rebase(self, tool_now: npt.NDArray[np.float64], target: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         """Holds the tool's current orientation: returns the target to solve instead, with the new offset applied."""
-        self.offset = tool_now[:3, :3] @ np.asarray(target, float)[:3, :3].T
+        self.offset = np.asarray(target, float)[:3, :3].T @ tool_now[:3, :3]
         self._window.clear()
         self.rebases += 1
         return self.apply(target)

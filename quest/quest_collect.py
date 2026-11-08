@@ -306,8 +306,9 @@ class Tuning:
 
 ## A press of the right stick while recording asks for a second press within this long: discard, then home.
 HOME_CONFIRM_S = 2.0
-## Homing first lifts a tool lower than its home height up to it, for at most this long, then moves the joints home.
-LIFT_TIMEOUT_S = 4.0
+## Homing first lifts a tool lower than its home height up to it (at most LIFT_SPEED_M_S, and every joint at most the
+## kit's HOME_SPEED_RAD_S), then moves the joints home; a lift that has not arrived in LIFT_TIMEOUT_S stops homing.
+LIFT_TIMEOUT_S = 8.0
 LIFT_TOLERANCE_M = 0.01
 LIFT_SPEED_M_S = 0.10
 
@@ -356,6 +357,7 @@ class QuestCollector(collect.Collector):
                     solver.flip_guard = WristFlipGuard()
                 clutch.on_engage = solver.reset_guard
         self._home_asked_s: float | None = None
+        self._home_asked_for: Any = None
         self._home_started_s: float | None = None
         self._lift: dict[str, tuple[npt.NDArray[np.float64], float]] | None = None
         self._lift_deadline_s = 0.0
@@ -390,14 +392,21 @@ class QuestCollector(collect.Collector):
                     # (the tool where it is, the height to reach); the target rises at LIFT_SPEED_M_S, a straight line
                     self._lift[side] = (tool.copy(), float(home[2, 3]))
             self._lift_deadline_s = time.monotonic() + LIFT_TIMEOUT_S
-        if self._lift and time.monotonic() < self._lift_deadline_s:
+        if self._lift:
+            if time.monotonic() > self._lift_deadline_s:
+                # Never fall through to the joint-space move from a low pose: that is what drags along the table.
+                self.homing = False
+                self._warn(f"{' and '.join(self._lift)} tool could not lift to its home height: homing stopped; "
+                           "raise it with the grip, then press the right stick again")
+                return
+            max_step = collect.HOME_SPEED_RAD_S * self._dt_s
             for side, (target, top_z) in list(self._lift.items()):
                 solver = self._iks[side]
-                guard = getattr(solver, "flip_guard", None)
-                if guard is not None:
-                    guard.reset()
+                joints = self._command.joints[side]
                 target[2, 3] = min(top_z, target[2, 3] + LIFT_SPEED_M_S * self._dt_s)
-                self._command.joints[side] = solver.step(target, self._command.joints[side], self._dt_s)
+                # The lift holds the tool's orientation, so the flip guard has nothing to do; homing's speed applies.
+                solve = solver._solve if isinstance(solver, SmoothIK) else solver.step
+                self._command.joints[side] = teleop.step_toward(joints, solve(target, joints, self._dt_s), max_step)
                 if solver.fk(self._command.joints[side])[2, 3] >= top_z - LIFT_TOLERANCE_M:
                     del self._lift[side]
             return
@@ -416,11 +425,12 @@ class QuestCollector(collect.Collector):
     def _handle_buttons(self, pressed: frozenset[str]) -> None:
         if "RJ" in pressed and self.episode is not None:
             now = time.monotonic()
-            if self._home_asked_s is not None and now - self._home_asked_s <= HOME_CONFIRM_S:
+            if (self._home_asked_s is not None and now - self._home_asked_s <= HOME_CONFIRM_S
+                    and self._home_asked_for is self.episode):
                 self._home_asked_s = None
                 self.discard()                         # the kit's homing needs no episode open
             else:
-                self._home_asked_s = now
+                self._home_asked_s, self._home_asked_for = now, self.episode
                 self._warn(f"recording: press the right stick again within {HOME_CONFIRM_S:.0f} s to discard "
                            "this episode and home (or A to save it first)")
                 pressed = pressed - {"RJ"}

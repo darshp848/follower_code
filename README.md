@@ -33,7 +33,7 @@ cd ~/physical-ai-hacks
   halves wrist turns, and `--control-hz 30` restores the kit's rate.
 - **Replay bench** (offline, on the Metal URDF): 40 fast-wrist events from `unplug-v1` and `unplug-split-v1` replayed
   through the IK. With the kit's IK, 7 of the 40 swing joint4 or joint6 more than 90° (the worst swings 194°). With the
-  guard, 1 of the 40 does (the worst swings 99°), and the tool's position stays within 8 mm. Human motion recorded on
+  guard, 2 of the 40 do (the worst swings 116°), and the tool's position stays within 8 mm. Human motion recorded on
   the leader arm (14 episodes), with 1.5 mm and 0.4° of Quest-like noise added: the wrist follows hand turns 27 ms
   behind, where the previous defaults lagged 105 ms. The median turn error is 1.0° (it was 2.8°), and rotation jitter
   is 40 % below the unfiltered kit's.
